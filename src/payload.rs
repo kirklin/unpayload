@@ -38,6 +38,13 @@ impl Payload {
         Self::from_reader(Arc::new(LocalFile::open(path.as_ref())?))
     }
 
+    /// Opens a `payload.bin` or OTA zip archive served over HTTP(S), fetching
+    /// only the byte ranges that are needed.
+    #[cfg(feature = "http")]
+    pub fn open_url(url: &str) -> Result<Self> {
+        Self::from_reader(Arc::new(crate::http::HttpFile::open(url)?))
+    }
+
     /// Reads a payload from any random-access source holding either a raw
     /// payload or an OTA zip archive.
     pub fn from_reader(reader: Arc<dyn ReadAt>) -> Result<Self> {
@@ -129,6 +136,10 @@ impl Payload {
     /// Offset of the operation data within the payload.
     pub fn data_offset(&self) -> u64 {
         self.data_offset
+    }
+
+    pub(crate) fn read_granularity(&self) -> u64 {
+        self.reader.read_granularity()
     }
 
     /// Reads `buf.len()` bytes of operation data starting at `offset`, which is

@@ -20,7 +20,7 @@ use crate::budget::Budget;
 use crate::error::{Error, Result, ensure, hex};
 use crate::extent::{byte_range, byte_ranges, ensure_disjoint, gaps, total_len};
 use crate::fsio::NamedFile;
-use crate::metadata::{InstallOperation, OperationType, PartitionInfo, PartitionUpdate};
+use crate::metadata::{OperationType, PartitionInfo, PartitionUpdate};
 use crate::operation::{self, Target};
 use crate::partition::{self, operation_type};
 use crate::payload::Payload;
@@ -28,6 +28,7 @@ use crate::source::SourceImage;
 use crate::verity;
 
 const COPY_PIECE: u64 = 8 << 20;
+const MAX_CHUNK_OPERATIONS: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct ExtractOptions {
@@ -195,6 +196,7 @@ struct Job<'p> {
     size: u64,
     block_size: u64,
     kinds: Vec<OperationType>,
+    chunks: Vec<Range<usize>>,
     source: Option<SourceImage>,
     fallthrough: Vec<Range<u64>>,
     output: PathBuf,
@@ -303,6 +305,7 @@ impl<'p> Job<'p> {
             size,
             block_size,
             kinds,
+            chunks: chunks(update, payload.read_granularity()),
             source,
             fallthrough,
             output,
@@ -350,11 +353,9 @@ impl<'p> Job<'p> {
             block_size: self.block_size,
             source: self.source.as_ref(),
         };
-        self.update
-            .operations
+        self.chunks
             .par_iter()
-            .enumerate()
-            .try_for_each(|(index, op)| self.run_operation(index, op, &target, run))?;
+            .try_for_each(|chunk| self.run_chunk(chunk.clone(), &target, run))?;
 
         run.check()?;
         verity::rebuild(self.update, image, self.block_size, &|bytes| {
@@ -405,34 +406,75 @@ impl<'p> Job<'p> {
         Ok(())
     }
 
-    fn run_operation(&self, index: usize, op: &InstallOperation, target: &Target, run: &Run) -> Result<()> {
-        run.check()?;
-        let kind = self.kinds[index];
-        let mut data = vec![0u8; op.data_length() as usize];
+    fn run_chunk(&self, chunk: Range<usize>, target: &Target, run: &Run) -> Result<()> {
+        let ops = &self.update.operations[chunk.clone()];
+        let with_data = || ops.iter().filter(|op| op.data_length() > 0);
+        let start = with_data().map(|op| op.data_offset()).min().unwrap_or(0);
+        let end = with_data()
+            .map(|op| op.data_offset() + op.data_length())
+            .max()
+            .unwrap_or(0);
+        let mut data = vec![0u8; (end - start) as usize];
         if !data.is_empty() {
-            run.payload.read_data(op.data_offset(), &mut data)?;
+            run.check()?;
+            run.payload.read_data(start, &mut data)?;
         }
-        let result = (|| {
-            if let Some(expected) = op.data_sha256_hash.as_deref().filter(|h| !h.is_empty()) {
-                let actual = Sha256::digest(&data);
-                ensure!(
-                    actual.as_slice() == expected,
-                    Error::hash_mismatch("operation data", expected, &actual)
-                );
-            }
-            let _permit = run.budget.acquire(operation::memory(op, kind, self.block_size));
-            operation::execute(op, kind, &data, target)
-        })();
-        result.map_err(|error| Error::Operation {
-            partition: self.name.to_owned(),
-            index,
-            kind: kind.name(),
-            source: Box::new(error),
-        })?;
-        let written = op.dst_extents.iter().map(|e| e.num_blocks()).sum::<u64>() * self.block_size;
-        run.progress(self.name, written);
+        for (index, op) in chunk.zip(ops) {
+            run.check()?;
+            let kind = self.kinds[index];
+            let blob = match op.data_length() {
+                0 => &[][..],
+                len => &data[(op.data_offset() - start) as usize..][..len as usize],
+            };
+            let result = (|| {
+                if let Some(expected) = op.data_sha256_hash.as_deref().filter(|h| !h.is_empty()) {
+                    let actual = Sha256::digest(blob);
+                    ensure!(
+                        actual.as_slice() == expected,
+                        Error::hash_mismatch("operation data", expected, &actual)
+                    );
+                }
+                let _permit = run.budget.acquire(operation::memory(op, kind, self.block_size));
+                operation::execute(op, kind, blob, target)
+            })();
+            result.map_err(|error| Error::Operation {
+                partition: self.name.to_owned(),
+                index,
+                kind: kind.name(),
+                source: Box::new(error),
+            })?;
+            let written = op.dst_extents.iter().map(|e| e.num_blocks()).sum::<u64>() * self.block_size;
+            run.progress(self.name, written);
+        }
         Ok(())
     }
+}
+
+/// Groups consecutive operations whose data is contiguous until a group holds
+/// at least `granularity` bytes, so remote payloads are read in few requests.
+fn chunks(update: &PartitionUpdate, granularity: u64) -> Vec<Range<usize>> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut data_end: Option<u64> = None;
+    let mut size = 0u64;
+    for (index, op) in update.operations.iter().enumerate() {
+        let len = op.data_length();
+        let breaks = len > 0 && data_end.is_some_and(|end| end != op.data_offset());
+        if index > start && (size >= granularity || breaks || index - start >= MAX_CHUNK_OPERATIONS) {
+            chunks.push(start..index);
+            start = index;
+            size = 0;
+            data_end = None;
+        }
+        if len > 0 {
+            data_end = Some(op.data_offset() + len);
+            size += len;
+        }
+    }
+    if start < update.operations.len() {
+        chunks.push(start..update.operations.len());
+    }
+    chunks
 }
 
 /// The hash a partition image should have, when the manifest gives one.

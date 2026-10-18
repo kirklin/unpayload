@@ -39,6 +39,10 @@ pub enum Error {
     #[error("cannot start worker threads")]
     Threads(#[source] rayon::ThreadPoolBuildError),
 
+    #[cfg(feature = "http")]
+    #[error("{0}")]
+    Http(String),
+
     #[error("partitions not in payload: {}", .0.join(", "))]
     UnknownPartitions(Vec<String>),
 

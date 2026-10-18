@@ -9,6 +9,10 @@ repository = "https://github.com/kirklin/unpayload"
 keywords = ["android", "ota", "payload", "firmware", "extract"]
 categories = ["compression", "filesystem"]
 
+[features]
+default = ["http"]
+http = ["dep:ureq"]
+
 [dependencies]
 blake2 = "0.11"
 brotli-decompressor = "6.1"
@@ -27,5 +31,10 @@ zerocopy = { version = "0.8", features = ["derive"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zstd = "0.14"
 
+ureq = { version = "3.4", default-features = false, features = ["rustls"], optional = true }
+
 [dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 flate2 = "1"
+tokio = { version = "1", features = ["rt", "net"] }
+tower-http = { version = "0.7", features = ["fs"] }

@@ -19,6 +19,12 @@ pub trait ReadAt: Send + Sync {
 
     /// Total number of bytes.
     fn size(&self) -> u64;
+
+    /// Reads smaller than this cost about as much as reads of this size, so
+    /// callers should combine adjacent reads up to it.
+    fn read_granularity(&self) -> u64 {
+        0
+    }
 }
 
 pub struct LocalFile {
@@ -78,6 +84,10 @@ impl ReadAt for Slice {
 
     fn size(&self) -> u64 {
         self.len
+    }
+
+    fn read_granularity(&self) -> u64 {
+        self.inner.read_granularity()
     }
 }
 

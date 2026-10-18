@@ -10,6 +10,8 @@ mod error;
 mod extent;
 mod extract;
 mod fsio;
+#[cfg(feature = "http")]
+mod http;
 mod input;
 mod introsort;
 mod lz4diff;

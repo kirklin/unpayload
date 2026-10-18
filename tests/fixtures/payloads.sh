@@ -37,7 +37,8 @@ erofs() {
     mkfs.erofs -T0 --all-root -U 00000000-0000-0000-0000-000000000000 --quiet "$@"
 }
 
-# Full payloads: compressible, incompressible and mixed partitions.
+# Full payloads: compressible, incompressible and mixed partitions. The
+# incompressible one makes the payload span many HTTP range requests.
 text $((1024 * KiB)) full >"$img/text.img"
 noise $((1024 * KiB)) >"$img/noise.img"
 {
