@@ -7,7 +7,7 @@ use crate::extent::{ExtentWriter, byte_ranges, total_len};
 use crate::fsio::NamedFile;
 use crate::metadata::{InstallOperation, OperationType};
 use crate::source::SourceImage;
-use crate::{bsdiff, puffin, zucchini};
+use crate::{bsdiff, lz4diff, puffin, zucchini};
 
 pub(crate) struct Target<'a> {
     pub image: NamedFile<'a>,
@@ -53,10 +53,12 @@ pub(crate) fn execute(op: &InstallOperation, kind: OperationType, data: &[u8], t
             );
             out.write(&new)
         }
+        OperationType::Lz4diffBsdiff | OperationType::Lz4diffPuffdiff => {
+            lz4diff::apply(&source_data(op, target)?, data, &mut out)
+        }
         OperationType::Move => Err(Error::invalid(
             "MOVE operations update a partition in place and cannot be extracted",
         )),
-        kind => Err(Error::invalid(format!("{} operations are not supported", kind.name()))),
     }
 }
 
@@ -68,7 +70,9 @@ pub(crate) fn memory(op: &InstallOperation, kind: OperationType, block_size: u64
     let dst = blocks(&op.dst_extents).saturating_mul(block_size);
     let data = op.data_length();
     match kind {
-        OperationType::Puffdiff => src.saturating_add(dst).saturating_mul(4).saturating_add(data),
+        OperationType::Puffdiff | OperationType::Lz4diffBsdiff | OperationType::Lz4diffPuffdiff => {
+            src.saturating_add(dst).saturating_mul(4).saturating_add(data)
+        }
         OperationType::Zucchini => src.saturating_add(dst).saturating_mul(2).saturating_add(data),
         _ => src.saturating_add(data),
     }

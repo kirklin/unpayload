@@ -14,6 +14,7 @@ brotli-decompressor = "6.1"
 bzip2 = "0.6"
 crc32fast = "1.5"
 liblzma = { version = "0.4", features = ["static"] }
+lz4-sys = "1.11"
 object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }
 prost = "0.14"
 rayon = "1.12"

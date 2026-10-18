@@ -33,6 +33,10 @@ keep() {
     cp "$3" "$out/$1/old/$2.img"
 }
 
+erofs() {
+    mkfs.erofs -T0 --all-root -U 00000000-0000-0000-0000-000000000000 --quiet "$@"
+}
+
 # Full payloads: compressible, incompressible and mixed partitions.
 text $((1024 * KiB)) full >"$img/text.img"
 noise $((1024 * KiB)) >"$img/noise.img"
@@ -77,8 +81,9 @@ for name in delta delta-bz2 delta-v3; do
         --old_partitions="$img/raw-older.img" --new_partitions="$img/raw-newer.img"
 done
 
-# Files in an ext4 image: executables for zucchini, an APK for puffin, and a
-# file only the newer image has.
+# Files in filesystem images: executables for zucchini, an APK for puffin, a
+# file only the newer image has, and text, uncompressed and compressed with
+# LZ4 and LZ4HC.
 noise $((192 * KiB)) | base64 >"$img/apk-text"
 for version in older newer; do
     tree=$img/files-$version
@@ -104,10 +109,37 @@ for version in older newer; do
     # The generator reads no file types from EROFS images, and only looks for
     # deflate streams in regular files, so this image is ext4.
     mke2fs -q -t ext4 -b 4096 -O ^has_journal -d "$tree" "$img/files-$version.img" 1M
+
+    # Compressed files: text, a zip whose deflate streams lz4diff patches
+    # with puffin, and data that is partly incompressible, which EROFS stores
+    # in uncompressed clusters.
+    packed=$img/packed-$version
+    mkdir -p "$packed/docs"
+    text $((384 * KiB)) "$version a" >"$packed/a.txt"
+    text $((160 * KiB)) "$version b" >"$packed/b.txt"
+    {
+        text $((24 * KiB)) notes
+        [[ $version == newer ]] && text $((2 * KiB)) changed
+        text $((96 * KiB)) "more notes"
+    } >"$packed/docs/notes.txt"
+    soong_zip -o "$packed/docs.zip" -C "$packed/docs" -f "$packed/docs/notes.txt"
+    rm -r "$packed/docs"
+    {
+        text $((64 * KiB)) "$version mixed"
+        head -c $((96 * KiB)) "$img/apk-text" | base64 -d
+    } >"$packed/mixed.bin"
+    erofs -zlz4hc,9 "$img/lz4hc-$version.img" "$packed"
+    erofs -zlz4 "$img/lz4-$version.img" "$packed"
 done
 keep files files "$img/files-older.img"
 payload files --minor_version=10 --enable_replace_zstd --partition_names=files \
     --old_partitions="$img/files-older.img" --new_partitions="$img/files-newer.img"
+for compression in lz4hc,9 lz4; do
+    name=${compression%%,*}
+    keep "$name" "$name" "$img/$name-older.img"
+    payload "$name" --minor_version=9 --enable_lz4diff=true --erofs_compression_param="$compression" \
+        --partition_names="$name" --old_partitions="$img/$name-older.img" --new_partitions="$img/$name-newer.img"
+done
 
 # Zucchini patches between the two builds of each executable, and between
 # unrelated data.

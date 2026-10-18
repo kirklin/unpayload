@@ -126,6 +126,22 @@ fn files() {
 }
 
 #[test]
+fn lz4hc() {
+    assert_uses(
+        &extract_all("lz4hc", Some("lz4hc")),
+        &["LZ4DIFF_BSDIFF", "LZ4DIFF_PUFFDIFF"],
+    );
+}
+
+#[test]
+fn lz4() {
+    assert_uses(
+        &extract_all("lz4", Some("lz4")),
+        &["LZ4DIFF_BSDIFF", "LZ4DIFF_PUFFDIFF"],
+    );
+}
+
+#[test]
 fn selected_partitions() {
     let payload = payload("full");
     let (mut options, out) = options(None);

@@ -12,6 +12,7 @@ mod extract;
 mod fsio;
 mod input;
 mod introsort;
+mod lz4diff;
 pub mod metadata;
 mod operation;
 pub mod partition;
