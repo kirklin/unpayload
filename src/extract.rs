@@ -8,6 +8,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,13 +17,16 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::budget::Budget;
-use crate::error::{Error, Result, ensure};
-use crate::extent::{byte_ranges, ensure_disjoint, total_len};
+use crate::error::{Error, Result, ensure, hex};
+use crate::extent::{byte_ranges, ensure_disjoint, gaps, total_len};
 use crate::fsio::NamedFile;
 use crate::metadata::{InstallOperation, OperationType, PartitionInfo, PartitionUpdate};
 use crate::operation::{self, Target};
 use crate::partition::{self, operation_type};
 use crate::payload::Payload;
+use crate::source::SourceImage;
+
+const COPY_PIECE: u64 = 8 << 20;
 
 #[derive(Clone, Debug)]
 pub struct ExtractOptions {
@@ -30,6 +34,9 @@ pub struct ExtractOptions {
     pub output_dir: PathBuf,
     /// Partitions to extract; all of them when empty.
     pub partitions: Vec<String>,
+    /// Directory holding `<partition>.img` source images, needed by
+    /// partitions an incremental payload patches.
+    pub source_dir: Option<PathBuf>,
     /// Replace images that already exist in `output_dir`.
     pub overwrite: bool,
     /// Worker threads; the number of CPUs when `None`.
@@ -46,6 +53,7 @@ impl Default for ExtractOptions {
         Self {
             output_dir: PathBuf::from("."),
             partitions: Vec::new(),
+            source_dir: None,
             overwrite: false,
             threads: None,
             memory_limit: 4 << 30,
@@ -186,6 +194,8 @@ struct Job<'p> {
     size: u64,
     block_size: u64,
     kinds: Vec<OperationType>,
+    source: Option<SourceImage>,
+    fallthrough: Vec<Range<u64>>,
     output: PathBuf,
     partial: PathBuf,
     work: u64,
@@ -220,6 +230,12 @@ impl<'p> Job<'p> {
             };
             let kind = operation_type(op)
                 .ok_or_else(|| in_operation(Error::invalid(format!("unsupported operation type {}", op.r#type))))?;
+            ensure!(
+                kind != OperationType::Move,
+                in_operation(Error::invalid(
+                    "MOVE operations update a partition in place and cannot be extracted"
+                ))
+            );
             let dst = byte_ranges(&op.dst_extents, block_size).map_err(in_operation)?;
             ensure!(
                 dst.iter().all(|range| range.end <= image_end),
@@ -238,7 +254,40 @@ impl<'p> Job<'p> {
 
         let output = options.output_dir.join(format!("{name}.img"));
         let partial = options.output_dir.join(format!("{name}.img.part"));
+        let source = if partition::reads_source(update) {
+            let dir = options
+                .source_dir
+                .as_ref()
+                .ok_or_else(|| Error::MissingSource(name.to_owned()))?;
+            let path = dir.join(format!("{name}.img"));
+            let image = SourceImage::open(&path)?;
+            if let Some(expected) = update.old_partition_info.as_ref().and_then(|info| info.size) {
+                ensure!(
+                    image.size() >= expected,
+                    Error::Source(format!(
+                        "{} is {} bytes, the payload updates an image of {expected} bytes",
+                        path.display(),
+                        image.size()
+                    ))
+                );
+            }
+            if same_file(&path, &output) {
+                return Err(Error::Source(format!(
+                    "{} is both the source image and the output, choose another output directory",
+                    path.display()
+                )));
+            }
+            Some(image)
+        } else {
+            None
+        };
         ensure!(options.overwrite || !output.exists(), Error::OutputExists(output));
+
+        let fallthrough = match &source {
+            Some(image) => gaps(&written, size.min(image.size())),
+            None => Vec::new(),
+        };
+        let work = total_len(&written) + total_len(&fallthrough);
 
         Ok(Self {
             update,
@@ -246,9 +295,11 @@ impl<'p> Job<'p> {
             size,
             block_size,
             kinds,
+            source,
+            fallthrough,
             output,
             partial,
-            work: total_len(&written),
+            work,
         })
     }
 
@@ -267,9 +318,29 @@ impl<'p> Job<'p> {
             path: &self.partial,
         };
 
+        if let Some(source) = &self.source {
+            let pieces: Vec<Range<u64>> = self
+                .fallthrough
+                .iter()
+                .flat_map(|range| {
+                    (range.start..range.end)
+                        .step_by(COPY_PIECE as usize)
+                        .map(move |start| start..(start + COPY_PIECE).min(range.end))
+                })
+                .collect();
+            pieces.par_iter().try_for_each(|piece| {
+                run.check()?;
+                let data = source.read(std::slice::from_ref(piece))?;
+                image.write_all_at(&data, piece.start)?;
+                run.progress(self.name, piece.end - piece.start);
+                Ok::<_, Error>(())
+            })?;
+        }
+
         let target = Target {
             image,
             block_size: self.block_size,
+            source: self.source.as_ref(),
         };
         self.update
             .operations
@@ -284,6 +355,11 @@ impl<'p> Job<'p> {
         if let Some(expected) = hash(self.update.new_partition_info.as_ref())
             && sha256 != expected
         {
+            // Blocks no operation reads are copied from the source unchecked,
+            // so a wrong source image may only show here.
+            if let Some(source) = &self.source {
+                self.check_source(source)?;
+            }
             return Err(Error::hash_mismatch(format!("{}.img", self.name), expected, &sha256));
         }
         drop(file);
@@ -297,6 +373,25 @@ impl<'p> Job<'p> {
         };
         (run.events)(Event::Extracted(&extracted));
         Ok(extracted)
+    }
+
+    /// Fails when `source` is not the image the payload updates.
+    fn check_source(&self, source: &SourceImage) -> Result<()> {
+        let info = self.update.old_partition_info.as_ref();
+        let (Some(size), Some(expected)) = (info.and_then(|info| info.size), hash(info)) else {
+            return Ok(());
+        };
+        let actual = source.digest(size)?;
+        ensure!(
+            actual == expected,
+            Error::Source(format!(
+                "{} is not the image this payload updates: it hashes to {}, expected {}",
+                source.path().display(),
+                hex(&actual),
+                hex(expected)
+            ))
+        );
+        Ok(())
     }
 
     fn run_operation(&self, index: usize, op: &InstallOperation, target: &Target, run: &Run) -> Result<()> {
@@ -314,7 +409,7 @@ impl<'p> Job<'p> {
                     Error::hash_mismatch("operation data", expected, &actual)
                 );
             }
-            let _permit = run.budget.acquire(operation::memory(op));
+            let _permit = run.budget.acquire(operation::memory(op, self.block_size));
             operation::execute(op, kind, &data, target)
         })();
         result.map_err(|error| Error::Operation {
@@ -345,6 +440,13 @@ fn digest(image: NamedFile, len: u64) -> Result<Vec<u8>> {
         offset += n as u64;
     }
     Ok(hasher.finalize().to_vec())
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 struct RemoveOnDrop<'a>(Option<&'a Path>);

@@ -36,6 +36,12 @@ pub enum Error {
     #[error("partitions not in payload: {}", .0.join(", "))]
     UnknownPartitions(Vec<String>),
 
+    #[error("partition {0} is incremental and needs its source image {0}.img")]
+    MissingSource(String),
+
+    #[error("{0}")]
+    Source(String),
+
     #[error("{} already exists", .0.display())]
     OutputExists(PathBuf),
 
@@ -44,6 +50,12 @@ pub enum Error {
         what: String,
         expected: String,
         actual: String,
+    },
+
+    #[error("{format} patch: {message}")]
+    Patch {
+        format: &'static str,
+        message: Cow<'static, str>,
     },
 
     #[error("partition {partition}, operation {index} ({kind})")]
@@ -72,6 +84,13 @@ pub enum Error {
 impl Error {
     pub(crate) fn invalid(message: impl Into<Cow<'static, str>>) -> Self {
         Self::InvalidPayload(message.into())
+    }
+
+    pub(crate) fn patch(format: &'static str, message: impl Into<Cow<'static, str>>) -> Self {
+        Self::Patch {
+            format,
+            message: message.into(),
+        }
     }
 
     pub(crate) fn file(path: &Path) -> impl FnOnce(io::Error) -> Self + '_ {

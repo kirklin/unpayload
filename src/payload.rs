@@ -70,6 +70,10 @@ impl Payload {
             manifest.block_size().is_power_of_two(),
             Error::invalid(format!("block size {} is not a power of two", manifest.block_size()))
         );
+        ensure!(
+            manifest.minor_version() != 1,
+            Error::invalid("in-place delta payloads (minor version 1) are not supported")
+        );
         Ok(Self {
             reader,
             manifest,

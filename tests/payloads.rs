@@ -20,11 +20,13 @@ fn payload(case: &str) -> Payload {
     Payload::open(data(case).join("payload.bin")).unwrap()
 }
 
-/// Options that write into a fresh directory.
-fn options() -> (ExtractOptions, TempDir) {
+/// Options that write into a fresh directory, reading source images from the
+/// `old` directory of `source`.
+fn options(source: Option<&str>) -> (ExtractOptions, TempDir) {
     let out = tempfile::tempdir().unwrap();
     let options = ExtractOptions {
         output_dir: out.path().to_owned(),
+        source_dir: source.map(|case| data(case).join("old")),
         ..ExtractOptions::default()
     };
     (options, out)
@@ -36,9 +38,9 @@ fn extract(payload: &Payload, options: &ExtractOptions) -> Result<Vec<Extracted>
 
 /// Extracts every partition of `case` and returns the operation types its
 /// payload uses.
-fn extract_all(case: &str) -> BTreeSet<String> {
+fn extract_all(case: &str, source: Option<&str>) -> BTreeSet<String> {
     let payload = payload(case);
-    let (options, out) = options();
+    let (options, out) = options(source);
     let extracted = extract(&payload, &options).unwrap();
     assert_eq!(extracted.len(), payload.partitions().len());
     for image in &extracted {
@@ -76,18 +78,40 @@ fn innermost(error: &Error) -> &Error {
 
 #[test]
 fn full() {
-    assert_uses(&extract_all("full"), &["REPLACE", "REPLACE_XZ"]);
+    assert_uses(&extract_all("full", None), &["REPLACE", "REPLACE_XZ"]);
 }
 
 #[test]
 fn full_zstd() {
-    assert_uses(&extract_all("full-zstd"), &["REPLACE_ZSTD"]);
+    assert_uses(&extract_all("full-zstd", None), &["REPLACE_ZSTD"]);
+}
+
+#[test]
+fn delta() {
+    assert_uses(
+        &extract_all("delta", Some("delta")),
+        &["SOURCE_COPY", "BROTLI_BSDIFF", "ZERO"],
+    );
+}
+
+#[test]
+fn delta_with_bzip2_streams() {
+    assert_uses(&extract_all("delta-bz2", Some("delta")), &["BROTLI_BSDIFF"]);
+}
+
+#[test]
+fn delta_minor_version_3() {
+    assert_eq!(payload("delta-v3").minor_version(), 3);
+    assert_uses(
+        &extract_all("delta-v3", Some("delta")),
+        &["SOURCE_BSDIFF", "REPLACE_BZ"],
+    );
 }
 
 #[test]
 fn selected_partitions() {
     let payload = payload("full");
-    let (mut options, out) = options();
+    let (mut options, out) = options(None);
     options.partitions = vec!["noise".into(), "text".into(), "noise".into()];
     let extracted = extract(&payload, &options).unwrap();
     let names: Vec<_> = extracted.iter().map(|image| image.partition.as_str()).collect();
@@ -97,7 +121,7 @@ fn selected_partitions() {
 
 #[test]
 fn unknown_partitions() {
-    let (mut options, _out) = options();
+    let (mut options, _out) = options(None);
     options.partitions = vec!["text".into(), "boot".into(), "vendor".into()];
     let error = extract(&payload("full"), &options).unwrap_err();
     assert!(matches!(&error, Error::UnknownPartitions(names) if names == &["boot", "vendor"]));
@@ -106,7 +130,7 @@ fn unknown_partitions() {
 #[test]
 fn existing_images() {
     let payload = payload("full");
-    let (mut options, out) = options();
+    let (mut options, out) = options(None);
     extract(&payload, &options).unwrap();
     let error = extract(&payload, &options).unwrap_err();
     assert!(matches!(error, Error::OutputExists(_)));
@@ -118,7 +142,7 @@ fn existing_images() {
 #[test]
 fn cancelled() {
     let cancel = Arc::new(AtomicBool::new(false));
-    let (mut options, out) = options();
+    let (mut options, out) = options(None);
     options.cancel = Some(cancel.clone());
     let error = payload("full")
         .extract(&options, &|event| {
@@ -128,6 +152,29 @@ fn cancelled() {
         })
         .unwrap_err();
     assert!(matches!(error, Error::Cancelled), "{error:?}");
+    assert_no_partial_files(out.path());
+}
+
+#[test]
+fn missing_source() {
+    let (options, _out) = options(None);
+    let error = extract(&payload("delta"), &options).unwrap_err();
+    assert!(matches!(&error, Error::MissingSource(name) if name == "raw"));
+}
+
+#[test]
+fn wrong_source() {
+    let source = tempfile::tempdir().unwrap();
+    let mut image = fs::read(data("delta/old/raw.img")).unwrap();
+    image[0] ^= 1;
+    fs::write(source.path().join("raw.img"), image).unwrap();
+    let (mut options, out) = options(None);
+    options.source_dir = Some(source.path().to_owned());
+    let error = extract(&payload("delta"), &options).unwrap_err();
+    assert!(
+        matches!(innermost(&error), Error::Source(message) if message.contains("is not the image")),
+        "{error:?}"
+    );
     assert_no_partial_files(out.path());
 }
 
@@ -142,7 +189,7 @@ fn corrupt_operation_data() {
     let path = dir.path().join("payload.bin");
     fs::write(&path, bytes).unwrap();
 
-    let (mut options, out) = options();
+    let (mut options, out) = options(None);
     options.partitions = vec!["text".into()];
     let error = extract(&Payload::open(&path).unwrap(), &options).unwrap_err();
     assert!(
@@ -158,7 +205,13 @@ fn truncated_payload() {
     let bytes = fs::read(data("full/payload.bin")).unwrap();
     let path = dir.path().join("payload.bin");
     fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
-    let (options, _out) = options();
+    let (options, _out) = options(None);
     let error = extract(&Payload::open(&path).unwrap(), &options).unwrap_err();
     assert!(matches!(innermost(&error), Error::InvalidPayload(_)), "{error:?}");
+}
+
+#[test]
+fn not_a_payload() {
+    let error = Payload::open(data("delta/old/raw.img")).err().unwrap();
+    assert!(matches!(error, Error::NotPayload(_)), "{error:?}");
 }

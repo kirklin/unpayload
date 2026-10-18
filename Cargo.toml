@@ -3,13 +3,14 @@ name = "unpayload"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Extract partition images from Android OTA payloads"
+description = "Extract partition images from Android OTA payloads, full and incremental"
 license = "MIT"
 repository = "https://github.com/kirklin/unpayload"
 keywords = ["android", "ota", "payload", "firmware", "extract"]
 categories = ["compression", "filesystem"]
 
 [dependencies]
+brotli-decompressor = "6.1"
 bzip2 = "0.6"
 liblzma = { version = "0.4", features = ["static"] }
 prost = "0.14"

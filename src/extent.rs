@@ -89,3 +89,22 @@ pub(crate) fn ensure_disjoint(ranges: &mut [Range<u64>]) -> Result<()> {
     }
     Ok(())
 }
+
+/// Parts of `0..limit` not covered by the sorted, disjoint `covered` ranges.
+pub(crate) fn gaps(covered: &[Range<u64>], limit: u64) -> Vec<Range<u64>> {
+    let mut gaps = Vec::new();
+    let mut cursor = 0;
+    for range in covered {
+        if range.start >= limit {
+            break;
+        }
+        if range.start > cursor {
+            gaps.push(cursor..range.start);
+        }
+        cursor = cursor.max(range.end);
+    }
+    if cursor < limit {
+        gaps.push(cursor..limit);
+    }
+    gaps
+}
