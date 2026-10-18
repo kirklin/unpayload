@@ -7,11 +7,16 @@ description = "Extract partition images from Android OTA payloads, full and incr
 license = "MIT"
 repository = "https://github.com/kirklin/unpayload"
 keywords = ["android", "ota", "payload", "firmware", "extract"]
-categories = ["compression", "filesystem"]
+categories = ["command-line-utilities", "compression", "filesystem"]
 
 [features]
-default = ["http"]
+default = ["cli", "http"]
+cli = ["dep:clap", "dep:ctrlc", "dep:indicatif", "dep:anyhow", "dep:serde", "dep:serde_json"]
 http = ["dep:ureq"]
+
+[[bin]]
+name = "unpayload"
+required-features = ["cli"]
 
 [dependencies]
 blake2 = "0.11"
@@ -31,6 +36,12 @@ zerocopy = { version = "0.8", features = ["derive"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zstd = "0.14"
 
+anyhow = { version = "1", optional = true }
+clap = { version = "4.6", features = ["derive", "wrap_help"], optional = true }
+ctrlc = { version = "3.5", features = ["termination"], optional = true }
+indicatif = { version = "0.18", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 ureq = { version = "3.4", default-features = false, features = ["rustls"], optional = true }
 
 [dev-dependencies]
@@ -38,3 +49,7 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 flate2 = "1"
 tokio = { version = "1", features = ["rt", "net"] }
 tower-http = { version = "0.7", features = ["fs"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
