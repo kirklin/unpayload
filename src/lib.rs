@@ -11,12 +11,14 @@ mod extent;
 mod extract;
 mod fsio;
 mod input;
+mod introsort;
 pub mod metadata;
 mod operation;
 pub mod partition;
 mod payload;
 mod sink;
 mod source;
+mod zucchini;
 
 pub use error::{Error, Result};
 pub use extract::{Event, ExtractOptions, Extracted};

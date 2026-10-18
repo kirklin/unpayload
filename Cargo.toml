@@ -12,11 +12,14 @@ categories = ["compression", "filesystem"]
 [dependencies]
 brotli-decompressor = "6.1"
 bzip2 = "0.6"
+crc32fast = "1.5"
 liblzma = { version = "0.4", features = ["static"] }
+object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }
 prost = "0.14"
 rayon = "1.12"
 sha2 = "0.11"
 tempfile = "3"
 thiserror = "2"
+zerocopy = { version = "0.8", features = ["derive"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zstd = "0.14"

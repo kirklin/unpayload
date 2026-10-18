@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the partition images and payloads the tests read, into /work/out.
-# Runs in an x86-64 Linux container with otatools at /ota.
+# Runs in an x86-64 Linux container with otatools at /ota, next to the
+# libraries and DEX files build.sh compiled into /work.
 set -euo pipefail
 export PATH=/ota/bin:$PATH
 export LD_LIBRARY_PATH=/ota/lib64
@@ -75,3 +76,22 @@ for name in delta delta-bz2 delta-v3; do
     payload "$name" "${flags[@]}" --partition_names=raw \
         --old_partitions="$img/raw-older.img" --new_partitions="$img/raw-newer.img"
 done
+
+# Zucchini patches between the two builds of each executable, and between
+# unrelated data.
+mkdir -p "$out/zucchini"
+for older in /work/elf/older/*.so /work/dex/older/classes.dex; do
+    file=${older#/work/*/older/}
+    name=${file%.*}
+    newer=${older/\/older\//\/newer\/}
+    cp "$older" "$out/zucchini/$name.older"
+    cp "$newer" "$out/zucchini/$name.newer"
+    zucchini -gen "$older" "$newer" "$out/zucchini/$name.zuc" >/dev/null
+done
+noise $((64 * KiB)) >"$out/zucchini/raw.older"
+{
+    head -c $((32 * KiB)) "$out/zucchini/raw.older"
+    noise $((8 * KiB))
+    tail -c $((32 * KiB)) "$out/zucchini/raw.older"
+} >"$out/zucchini/raw.newer"
+zucchini -gen -raw "$out/zucchini/raw.older" "$out/zucchini/raw.newer" "$out/zucchini/raw.zuc" >/dev/null

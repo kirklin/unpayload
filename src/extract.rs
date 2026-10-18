@@ -409,7 +409,7 @@ impl<'p> Job<'p> {
                     Error::hash_mismatch("operation data", expected, &actual)
                 );
             }
-            let _permit = run.budget.acquire(operation::memory(op, self.block_size));
+            let _permit = run.budget.acquire(operation::memory(op, kind, self.block_size));
             operation::execute(op, kind, &data, target)
         })();
         result.map_err(|error| Error::Operation {
