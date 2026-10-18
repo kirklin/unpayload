@@ -7,7 +7,7 @@ use crate::extent::{ExtentWriter, byte_ranges, total_len};
 use crate::fsio::NamedFile;
 use crate::metadata::{InstallOperation, OperationType};
 use crate::source::SourceImage;
-use crate::{bsdiff, zucchini};
+use crate::{bsdiff, puffin, zucchini};
 
 pub(crate) struct Target<'a> {
     pub image: NamedFile<'a>,
@@ -42,6 +42,7 @@ pub(crate) fn execute(op: &InstallOperation, kind: OperationType, data: &[u8], t
         OperationType::SourceBsdiff | OperationType::BrotliBsdiff | OperationType::Bsdiff => {
             bsdiff::apply(&source_data(op, target)?, data, &mut out)
         }
+        OperationType::Puffdiff => puffin::apply(&source_data(op, target)?, data, &mut out),
         OperationType::Zucchini => {
             let src = source_data(op, target)?;
             let patch = brotli_decode(data)?;
@@ -67,6 +68,7 @@ pub(crate) fn memory(op: &InstallOperation, kind: OperationType, block_size: u64
     let dst = blocks(&op.dst_extents).saturating_mul(block_size);
     let data = op.data_length();
     match kind {
+        OperationType::Puffdiff => src.saturating_add(dst).saturating_mul(4).saturating_add(data),
         OperationType::Zucchini => src.saturating_add(dst).saturating_mul(2).saturating_add(data),
         _ => src.saturating_add(data),
     }

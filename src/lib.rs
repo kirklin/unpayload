@@ -16,6 +16,7 @@ pub mod metadata;
 mod operation;
 pub mod partition;
 mod payload;
+mod puffin;
 mod sink;
 mod source;
 mod zucchini;

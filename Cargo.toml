@@ -23,3 +23,6 @@ thiserror = "2"
 zerocopy = { version = "0.8", features = ["derive"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zstd = "0.14"
+
+[dev-dependencies]
+flate2 = "1"

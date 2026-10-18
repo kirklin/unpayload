@@ -77,6 +77,38 @@ for name in delta delta-bz2 delta-v3; do
         --old_partitions="$img/raw-older.img" --new_partitions="$img/raw-newer.img"
 done
 
+# Files in an ext4 image: executables for zucchini, an APK for puffin, and a
+# file only the newer image has.
+noise $((192 * KiB)) | base64 >"$img/apk-text"
+for version in older newer; do
+    tree=$img/files-$version
+    mkdir -p "$tree/lib" "$tree/app"
+    cp /work/elf/$version/*.so "$tree/lib/"
+    {
+        printf 'vdex027\0'
+        zeros 24
+        cat /work/dex/$version/classes.dex
+    } >"$tree/app/app.vdex"
+    # A small change early in poorly compressible text rewrites all the
+    # deflate output after it, which puffin diffs far better than bsdiff.
+    {
+        head -c $((8 * KiB)) "$img/apk-text"
+        [[ $version == newer ]] && text $((2 * KiB)) changed
+        tail -c +$((8 * KiB + 1)) "$img/apk-text"
+    } >"$tree/app/notes.txt"
+    cp /work/dex/$version/classes.dex "$tree/app/classes.dex"
+    soong_zip -o "$tree/app/app.apk" -C "$tree/app" -f "$tree/app/notes.txt" -f "$tree/app/classes.dex"
+    rm "$tree/app/classes.dex"
+    # Diffing against the most similar old file loses to compressing this.
+    [[ $version == newer ]] && (yes 'only in the newer image' || true) | head -c $((64 * KiB)) >"$tree/added.txt"
+    # The generator reads no file types from EROFS images, and only looks for
+    # deflate streams in regular files, so this image is ext4.
+    mke2fs -q -t ext4 -b 4096 -O ^has_journal -d "$tree" "$img/files-$version.img" 1M
+done
+keep files files "$img/files-older.img"
+payload files --minor_version=10 --enable_replace_zstd --partition_names=files \
+    --old_partitions="$img/files-older.img" --new_partitions="$img/files-newer.img"
+
 # Zucchini patches between the two builds of each executable, and between
 # unrelated data.
 mkdir -p "$out/zucchini"

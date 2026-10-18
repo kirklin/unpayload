@@ -110,6 +110,22 @@ fn delta_minor_version_3() {
 }
 
 #[test]
+fn files() {
+    assert_uses(
+        &extract_all("files", Some("files")),
+        &[
+            "ZUCCHINI",
+            "PUFFDIFF",
+            "REPLACE_ZSTD",
+            "REPLACE_BZ",
+            "BROTLI_BSDIFF",
+            "SOURCE_COPY",
+            "ZERO",
+        ],
+    );
+}
+
+#[test]
 fn selected_partitions() {
     let payload = payload("full");
     let (mut options, out) = options(None);
