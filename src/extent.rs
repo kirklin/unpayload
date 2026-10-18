@@ -21,6 +21,13 @@ pub(crate) fn byte_ranges(extents: &[Extent], block_size: u64) -> Result<Vec<Ran
         .collect()
 }
 
+/// Byte range of a single optional extent; empty when absent.
+pub(crate) fn byte_range(extent: Option<Extent>, block_size: u64) -> Result<Range<u64>> {
+    Ok(byte_ranges(&extent.into_iter().collect::<Vec<_>>(), block_size)?
+        .pop()
+        .unwrap_or(0..0))
+}
+
 pub(crate) fn total_len(ranges: &[Range<u64>]) -> u64 {
     ranges.iter().map(|r| r.end - r.start).sum()
 }

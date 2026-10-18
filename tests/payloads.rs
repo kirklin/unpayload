@@ -142,6 +142,24 @@ fn lz4() {
 }
 
 #[test]
+fn verity() {
+    let payload = payload("verity");
+    let algorithms: Vec<_> = payload
+        .partitions()
+        .iter()
+        .map(|update| {
+            assert!(partition::has_hash_tree(update) && partition::has_fec(update));
+            (update.hash_tree_algorithm.clone().unwrap(), update.fec_roots())
+        })
+        .collect();
+    assert_eq!(
+        algorithms,
+        [("sha1".into(), 2), ("sha256".into(), 4), ("sha512".into(), 8)]
+    );
+    extract_all("verity", Some("verity"));
+}
+
+#[test]
 fn selected_partitions() {
     let payload = payload("full");
     let (mut options, out) = options(None);

@@ -20,6 +20,7 @@ mod payload;
 mod puffin;
 mod sink;
 mod source;
+mod verity;
 mod zucchini;
 
 pub use error::{Error, Result};

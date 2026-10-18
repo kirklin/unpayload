@@ -141,6 +141,34 @@ for compression in lz4hc,9 lz4; do
         --partition_names="$name" --old_partitions="$img/$name-older.img" --new_partitions="$img/$name-newer.img"
 done
 
+# Verity: hash trees and FEC that the device computes after installing a
+# delta, for each hash algorithm and several FEC root counts.
+noise $((64 * KiB)) >"$img/verity-noise"
+# verity IMAGE ALGORITHM ROOTS TAG
+verity() {
+    {
+        text $((512 * KiB)) "$4"
+        cat "$img/verity-noise"
+        text $((256 * KiB)) tail
+    } >"$1"
+    avbtool add_hashtree_footer --image "$1" --partition_name verity --partition_size $((1024 * KiB)) \
+        --hash_algorithm "$2" --fec_num_roots "$3" --salt 5eed5eed
+}
+older=()
+newer=()
+for build in sha1:2 sha256:4 sha512:8; do
+    algorithm=${build%%:*}
+    roots=${build#*:}
+    for version in older newer; do
+        verity "$img/$algorithm-$version.img" "$algorithm" "$roots" "$version"
+    done
+    keep verity "$algorithm" "$img/$algorithm-older.img"
+    older+=("$img/$algorithm-older.img")
+    newer+=("$img/$algorithm-newer.img")
+done
+payload verity --minor_version=9 --partition_names=sha1:sha256:sha512 \
+    --old_partitions="$(IFS=:; echo "${older[*]}")" --new_partitions="$(IFS=:; echo "${newer[*]}")"
+
 # Zucchini patches between the two builds of each executable, and between
 # unrelated data.
 mkdir -p "$out/zucchini"

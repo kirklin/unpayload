@@ -10,6 +10,7 @@ keywords = ["android", "ota", "payload", "firmware", "extract"]
 categories = ["compression", "filesystem"]
 
 [dependencies]
+blake2 = "0.11"
 brotli-decompressor = "6.1"
 bzip2 = "0.6"
 crc32fast = "1.5"
@@ -18,6 +19,7 @@ lz4-sys = "1.11"
 object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }
 prost = "0.14"
 rayon = "1.12"
+sha1 = "0.11"
 sha2 = "0.11"
 tempfile = "3"
 thiserror = "2"

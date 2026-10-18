@@ -18,13 +18,14 @@ use sha2::{Digest, Sha256};
 
 use crate::budget::Budget;
 use crate::error::{Error, Result, ensure, hex};
-use crate::extent::{byte_ranges, ensure_disjoint, gaps, total_len};
+use crate::extent::{byte_range, byte_ranges, ensure_disjoint, gaps, total_len};
 use crate::fsio::NamedFile;
 use crate::metadata::{InstallOperation, OperationType, PartitionInfo, PartitionUpdate};
 use crate::operation::{self, Target};
 use crate::partition::{self, operation_type};
 use crate::payload::Payload;
 use crate::source::SourceImage;
+use crate::verity;
 
 const COPY_PIECE: u64 = 8 << 20;
 
@@ -283,11 +284,18 @@ impl<'p> Job<'p> {
         };
         ensure!(options.overwrite || !output.exists(), Error::OutputExists(output));
 
+        let tree = byte_range(update.hash_tree_extent, block_size).map_err(in_partition)?;
+        let fec = byte_range(update.fec_extent, block_size).map_err(in_partition)?;
         let fallthrough = match &source {
-            Some(image) => gaps(&written, size.min(image.size())),
+            Some(image) => {
+                let mut covered = written.clone();
+                covered.extend([tree.clone(), fec.clone()]);
+                covered.sort_unstable_by_key(|range| range.start);
+                gaps(&covered, size.min(image.size()))
+            }
             None => Vec::new(),
         };
-        let work = total_len(&written) + total_len(&fallthrough);
+        let work = total_len(&written) + total_len(&fallthrough) + (tree.end - tree.start) + (fec.end - fec.start);
 
         Ok(Self {
             update,
@@ -349,6 +357,9 @@ impl<'p> Job<'p> {
             .try_for_each(|(index, op)| self.run_operation(index, op, &target, run))?;
 
         run.check()?;
+        verity::rebuild(self.update, image, self.block_size, &|bytes| {
+            run.progress(self.name, bytes)
+        })?;
         file.set_len(self.size).map_err(Error::file(&self.partial))?;
 
         let sha256 = digest(image, self.size)?;

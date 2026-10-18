@@ -35,3 +35,13 @@ pub fn operation_counts(update: &PartitionUpdate) -> BTreeMap<String, usize> {
     }
     counts
 }
+
+/// Whether the dm-verity hash tree is recomputed after the operations run.
+pub fn has_hash_tree(update: &PartitionUpdate) -> bool {
+    update.hash_tree_extent.is_some_and(|e| e.num_blocks() > 0)
+}
+
+/// Whether dm-verity FEC parity is recomputed after the operations run.
+pub fn has_fec(update: &PartitionUpdate) -> bool {
+    update.fec_extent.is_some_and(|e| e.num_blocks() > 0)
+}
