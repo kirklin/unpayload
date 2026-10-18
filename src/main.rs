@@ -1,17 +1,17 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
 use indicatif::{HumanBytes, HumanDuration, ProgressBar, ProgressStyle};
 use serde::Serialize;
-use unpayload::{Error, Event, ExtractOptions, Payload, partition};
+use unpayload::{Error, Event, ExtractOptions, Extracted, Payload, partition};
 
 /// Extract partition images from Android OTA payloads, full or incremental.
 #[derive(Parser)]
@@ -48,11 +48,11 @@ struct Cli {
     #[arg(short, long, value_name = "N")]
     jobs: Option<NonZeroUsize>,
 
-    /// Print JSON instead of text
+    /// Print JSON instead of text; extraction prints one object per line, for progress and for each image
     #[arg(long)]
     json: bool,
 
-    /// Print nothing but errors
+    /// Print nothing but errors; with --json, nothing but the images
     #[arg(short, long)]
     quiet: bool,
 }
@@ -103,6 +103,108 @@ struct Image<'a> {
     sha256: Option<String>,
 }
 
+impl<'a> From<&'a Extracted> for Image<'a> {
+    fn from(image: &'a Extracted) -> Self {
+        Self {
+            partition: &image.partition,
+            path: &image.path,
+            size: image.size,
+            sha256: image.sha256.as_deref().map(hex),
+        }
+    }
+}
+
+/// A line of `--json` output while extracting.
+#[derive(Serialize)]
+#[serde(tag = "event", rename_all = "lowercase")]
+enum Line<'a> {
+    /// How much of a partition is written, in whole percent.
+    Progress {
+        partition: &'a str,
+        percent: u64,
+    },
+    Extracted(Image<'a>),
+}
+
+/// Prints extraction events to standard output as JSON lines: the progress
+/// of a partition whenever its percentage grows, unless `progress` is off,
+/// and every finished image.
+struct JsonLines {
+    progress: bool,
+    state: Mutex<JsonState>,
+}
+
+#[derive(Default)]
+struct JsonState {
+    partitions: HashMap<String, Tally>,
+    /// The first write that failed; nothing is written after it.
+    error: Option<io::Error>,
+}
+
+struct Tally {
+    written: u64,
+    total: u64,
+    printed: Option<u64>,
+}
+
+impl JsonLines {
+    fn write(&self, event: &Event) {
+        let mut state = self.state.lock().unwrap();
+        match *event {
+            Event::Started { partitions } => {
+                state.partitions = partitions
+                    .iter()
+                    .map(|&(name, total)| {
+                        let tally = Tally {
+                            written: 0,
+                            total,
+                            printed: None,
+                        };
+                        (name.to_owned(), tally)
+                    })
+                    .collect();
+            }
+            Event::Progress { partition, bytes } if self.progress => {
+                let tally = state
+                    .partitions
+                    .get_mut(partition)
+                    .expect("progress of a partition the extraction did not start");
+                tally.written += bytes;
+                let percent = (tally.written * 100).checked_div(tally.total).unwrap_or(100);
+                if tally.printed.is_none_or(|printed| percent > printed) {
+                    tally.printed = Some(percent);
+                    state.print(&Line::Progress { partition, percent });
+                }
+            }
+            Event::Progress { .. } => {}
+            Event::Extracted(image) => state.print(&Line::Extracted(image.into())),
+        }
+    }
+
+    /// Fails with the error a write failed with, if one did.
+    fn finish(self) -> io::Result<()> {
+        match self.state.into_inner().unwrap().error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl JsonState {
+    fn print(&mut self, line: &Line) {
+        if self.error.is_some() {
+            return;
+        }
+        let mut out = io::stdout().lock();
+        let written = serde_json::to_writer(&mut out, line)
+            .map_err(io::Error::from)
+            .and_then(|()| writeln!(out));
+        if let Err(error) = written {
+            self.error = Some(error);
+        }
+    }
+}
+
 fn extract(payload: &Payload, cli: &Cli) -> Result<()> {
     // An interrupt stops extraction and removes unfinished images; a second
     // one ends the program at once.
@@ -124,56 +226,54 @@ fn extract(payload: &Payload, cli: &Cli) -> Result<()> {
         ..ExtractOptions::default()
     };
     let report = !cli.quiet && !cli.json;
-    let bar = if cli.quiet {
-        ProgressBar::hidden()
-    } else {
+    let bar = if report {
         ProgressBar::new(0).with_style(
             ProgressStyle::with_template(
                 "{wide_bar} {percent:>3}%  {bytes}/{total_bytes}  {binary_bytes_per_sec}  {msg}",
             )?
             .progress_chars("━╸─"),
         )
+    } else {
+        ProgressBar::hidden()
     };
+    let lines = cli.json.then(|| JsonLines {
+        progress: !cli.quiet,
+        state: Mutex::default(),
+    });
     let count = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let width = AtomicUsize::new(0);
     let started = Instant::now();
 
-    let extracted = payload.extract(&options, &|event| match event {
-        Event::Started { partitions, total } => {
-            count.store(partitions.len(), Ordering::Relaxed);
-            let longest = partitions.iter().map(|name| name.len()).max().unwrap_or(0);
-            width.store(longest + ".img".len(), Ordering::Relaxed);
-            bar.set_length(total);
-            bar.set_message(format!("0/{} images", partitions.len()));
+    let extracted = payload.extract(&options, &|event| {
+        if let Some(lines) = &lines {
+            lines.write(&event);
         }
-        Event::Progress { bytes, .. } => bar.inc(bytes),
-        Event::Extracted(image) => {
-            let done = done.fetch_add(1, Ordering::Relaxed) + 1;
-            bar.set_message(format!("{done}/{} images", count.load(Ordering::Relaxed)));
-            if report {
-                let name = format!("{}.img", image.partition);
-                let width = width.load(Ordering::Relaxed);
-                bar.suspend(|| eprintln!("{name:<width$}  {:>11}", HumanBytes(image.size).to_string()));
+        match event {
+            Event::Started { partitions } => {
+                count.store(partitions.len(), Ordering::Relaxed);
+                let longest = partitions.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+                width.store(longest + ".img".len(), Ordering::Relaxed);
+                bar.set_length(partitions.iter().map(|(_, bytes)| bytes).sum());
+                bar.set_message(format!("0/{} images", partitions.len()));
+            }
+            Event::Progress { bytes, .. } => bar.inc(bytes),
+            Event::Extracted(image) => {
+                let done = done.fetch_add(1, Ordering::Relaxed) + 1;
+                bar.set_message(format!("{done}/{} images", count.load(Ordering::Relaxed)));
+                if report {
+                    let name = format!("{}.img", image.partition);
+                    let width = width.load(Ordering::Relaxed);
+                    bar.suspend(|| eprintln!("{name:<width$}  {:>11}", HumanBytes(image.size).to_string()));
+                }
             }
         }
     });
     bar.finish_and_clear();
     let extracted = extracted?;
 
-    if cli.json {
-        let images: Vec<Image> = extracted
-            .iter()
-            .map(|image| Image {
-                partition: &image.partition,
-                path: &image.path,
-                size: image.size,
-                sha256: image.sha256.as_deref().map(hex),
-            })
-            .collect();
-        let mut out = io::stdout().lock();
-        serde_json::to_writer_pretty(&mut out, &images)?;
-        writeln!(out)?;
+    if let Some(lines) = lines {
+        lines.finish()?;
     } else if report {
         let total: u64 = extracted.iter().map(|image| image.size).sum();
         eprintln!(

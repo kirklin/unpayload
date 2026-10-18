@@ -72,8 +72,9 @@ impl Default for ExtractOptions {
 /// Progress of an extraction.
 #[derive(Debug)]
 pub enum Event<'a> {
-    /// Extraction begins; `total` is the number of bytes that will be written.
-    Started { partitions: &'a [&'a str], total: u64 },
+    /// Extraction begins with these partitions, each with the number of bytes
+    /// its progress events add up to.
+    Started { partitions: &'a [(&'a str, u64)] },
     /// `bytes` more bytes of `partition` were written.
     Progress { partition: &'a str, bytes: u64 },
     /// An image was finished and moved into place.
@@ -99,11 +100,9 @@ impl Payload {
             .collect::<Result<Vec<_>>>()?;
         fs::create_dir_all(&options.output_dir).map_err(Error::file(&options.output_dir))?;
 
-        let names: Vec<&str> = jobs.iter().map(|job| job.name).collect();
-        let total = jobs.iter().map(|job| job.work).sum();
+        let partitions: Vec<(&str, u64)> = jobs.iter().map(|job| (job.name, job.work)).collect();
         events(Event::Started {
-            partitions: &names,
-            total,
+            partitions: &partitions,
         });
 
         let threads = options
