@@ -3,8 +3,8 @@
 //! Every selected partition is validated before anything is written. The
 //! operations of all partitions then run in parallel: they write disjoint
 //! block ranges of their images, so their order does not matter. Images are
-//! written under a `.part` name and renamed once their SHA-256 matches the
-//! manifest.
+//! written under a `.part` name and renamed once complete and, unless
+//! verification is off, once their SHA-256 matches the manifest.
 
 use std::fs::{self, OpenOptions};
 use std::num::NonZeroUsize;
@@ -41,6 +41,10 @@ pub struct ExtractOptions {
     pub source_dir: Option<PathBuf>,
     /// Replace images that already exist in `output_dir`.
     pub overwrite: bool,
+    /// Check the source data operations read and every finished image
+    /// against the SHA-256 hashes in the manifest. Operation data is checked
+    /// either way.
+    pub verify: bool,
     /// Worker threads; the number of CPUs when `None`.
     pub threads: Option<NonZeroUsize>,
     /// Memory that operations running at the same time may hold, in bytes.
@@ -57,6 +61,7 @@ impl Default for ExtractOptions {
             partitions: Vec::new(),
             source_dir: None,
             overwrite: false,
+            verify: true,
             threads: None,
             memory_limit: 4 << 30,
             cancel: None,
@@ -71,7 +76,7 @@ pub enum Event<'a> {
     Started { partitions: &'a [&'a str], total: u64 },
     /// `bytes` more bytes of `partition` were written.
     Progress { partition: &'a str, bytes: u64 },
-    /// An image was verified and moved into place.
+    /// An image was finished and moved into place.
     Extracted(&'a Extracted),
 }
 
@@ -80,7 +85,8 @@ pub struct Extracted {
     pub partition: String,
     pub path: PathBuf,
     pub size: u64,
-    pub sha256: Vec<u8>,
+    /// SHA-256 of the image; `None` when verification is off.
+    pub sha256: Option<Vec<u8>>,
 }
 
 impl Payload {
@@ -111,6 +117,7 @@ impl Payload {
         let run = Run {
             payload: self,
             budget: Budget::new(options.memory_limit),
+            verify: options.verify,
             aborted: AtomicBool::new(false),
             cancel: options.cancel.as_deref(),
             failure: Mutex::new(None),
@@ -148,6 +155,7 @@ fn select<'p>(payload: &'p Payload, names: &[String]) -> Result<Vec<&'p Partitio
 struct Run<'a> {
     payload: &'a Payload,
     budget: Budget,
+    verify: bool,
     aborted: AtomicBool,
     cancel: Option<&'a AtomicBool>,
     failure: Mutex<Option<Error>>,
@@ -352,6 +360,7 @@ impl<'p> Job<'p> {
             image,
             block_size: self.block_size,
             source: self.source.as_ref(),
+            verify: run.verify,
         };
         self.chunks
             .par_iter()
@@ -363,17 +372,7 @@ impl<'p> Job<'p> {
         })?;
         file.set_len(self.size).map_err(Error::file(&self.partial))?;
 
-        let sha256 = digest(image, self.size)?;
-        if let Some(expected) = hash(self.update.new_partition_info.as_ref())
-            && sha256 != expected
-        {
-            // Blocks no operation reads are copied from the source unchecked,
-            // so a wrong source image may only show here.
-            if let Some(source) = &self.source {
-                self.check_source(source)?;
-            }
-            return Err(Error::hash_mismatch(format!("{}.img", self.name), expected, &sha256));
-        }
+        let sha256 = run.verify.then(|| self.verify(image)).transpose()?;
         drop(file);
         fs::rename(&self.partial, &self.output).map_err(Error::file(&self.output))?;
         partial.disarm();
@@ -385,6 +384,22 @@ impl<'p> Job<'p> {
         };
         (run.events)(Event::Extracted(&extracted));
         Ok(extracted)
+    }
+
+    /// Hashes the finished image and checks it against the manifest.
+    fn verify(&self, image: NamedFile) -> Result<Vec<u8>> {
+        let sha256 = digest(image, self.size)?;
+        if let Some(expected) = hash(self.update.new_partition_info.as_ref())
+            && sha256 != expected
+        {
+            // Blocks no operation reads are copied from the source unchecked,
+            // so a wrong source image may only show here.
+            if let Some(source) = &self.source {
+                self.check_source(source)?;
+            }
+            return Err(Error::hash_mismatch(format!("{}.img", self.name), expected, &sha256));
+        }
+        Ok(sha256)
     }
 
     /// Fails when `source` is not the image the payload updates.

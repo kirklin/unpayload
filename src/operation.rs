@@ -13,6 +13,8 @@ pub(crate) struct Target<'a> {
     pub image: NamedFile<'a>,
     pub block_size: u64,
     pub source: Option<&'a SourceImage>,
+    /// Check the source data operations read against their SHA-256.
+    pub verify: bool,
 }
 
 /// Runs `op` with its operation `data`, writing into the target image.
@@ -91,7 +93,9 @@ fn source_data(op: &InstallOperation, target: &Target) -> Result<Vec<u8>> {
         "operation reads a source image the partition does not use",
     ))?;
     let data = source.read(&byte_ranges(&op.src_extents, target.block_size)?)?;
-    if let Some(expected) = op.src_sha256_hash.as_deref().filter(|h| !h.is_empty()) {
+    if target.verify
+        && let Some(expected) = op.src_sha256_hash.as_deref().filter(|h| !h.is_empty())
+    {
         let actual = Sha256::digest(&data);
         ensure!(
             actual.as_slice() == expected,

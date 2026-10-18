@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use unpayload::{Error, Event, ExtractOptions, Extracted, Payload, partition};
 
@@ -67,6 +68,16 @@ fn assert_no_partial_files(dir: &Path) {
         let name = entry.unwrap().file_name();
         assert!(!name.to_string_lossy().ends_with(".part"), "{name:?} left behind");
     }
+}
+
+/// A directory holding the delta case's source image with its first byte
+/// changed.
+fn changed_source() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let mut image = fs::read(data("delta/old/raw.img")).unwrap();
+    image[0] ^= 1;
+    fs::write(dir.path().join("raw.img"), image).unwrap();
+    dir
 }
 
 /// The error under the partition and operation it happened in.
@@ -215,10 +226,7 @@ fn missing_source() {
 
 #[test]
 fn wrong_source() {
-    let source = tempfile::tempdir().unwrap();
-    let mut image = fs::read(data("delta/old/raw.img")).unwrap();
-    image[0] ^= 1;
-    fs::write(source.path().join("raw.img"), image).unwrap();
+    let source = changed_source();
     let (mut options, out) = options(None);
     options.source_dir = Some(source.path().to_owned());
     let error = extract(&payload("delta"), &options).unwrap_err();
@@ -229,6 +237,23 @@ fn wrong_source() {
     assert_no_partial_files(out.path());
 }
 
+/// Without verification, a wrong source image gives a wrong image instead of
+/// an error.
+#[test]
+fn unverified_source() {
+    let source = changed_source();
+    let (mut options, _out) = options(None);
+    options.source_dir = Some(source.path().to_owned());
+    options.verify = false;
+    let payload = payload("delta");
+    let extracted = extract(&payload, &options).unwrap();
+    assert_eq!(extracted[0].sha256, None);
+    let expected = payload.partition("raw").unwrap().new_partition_info.as_ref().unwrap();
+    let actual = Sha256::digest(fs::read(&extracted[0].path).unwrap());
+    assert_ne!(expected.hash.as_deref(), Some(actual.as_slice()));
+}
+
+/// Operation data is checked whether verification is on or off.
 #[test]
 fn corrupt_operation_data() {
     let dir = tempfile::tempdir().unwrap();
@@ -240,14 +265,17 @@ fn corrupt_operation_data() {
     let path = dir.path().join("payload.bin");
     fs::write(&path, bytes).unwrap();
 
-    let (mut options, out) = options(None);
-    options.partitions = vec!["text".into()];
-    let error = extract(&Payload::open(&path).unwrap(), &options).unwrap_err();
-    assert!(
-        matches!(innermost(&error), Error::HashMismatch { what, .. } if what == "operation data"),
-        "{error:?}"
-    );
-    assert_no_partial_files(out.path());
+    for verify in [true, false] {
+        let (mut options, out) = options(None);
+        options.partitions = vec!["text".into()];
+        options.verify = verify;
+        let error = extract(&Payload::open(&path).unwrap(), &options).unwrap_err();
+        assert!(
+            matches!(innermost(&error), Error::HashMismatch { what, .. } if what == "operation data"),
+            "{error:?}"
+        );
+        assert_no_partial_files(out.path());
+    }
 }
 
 #[test]

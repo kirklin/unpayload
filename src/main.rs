@@ -40,6 +40,10 @@ struct Cli {
     #[arg(short, long)]
     force: bool,
 
+    /// Skip checking source and extracted images against the SHA-256 hashes in the payload
+    #[arg(long)]
+    no_verify: bool,
+
     /// Number of worker threads [default: number of CPUs]
     #[arg(short, long, value_name = "N")]
     jobs: Option<NonZeroUsize>,
@@ -96,7 +100,7 @@ struct Image<'a> {
     partition: &'a str,
     path: &'a Path,
     size: u64,
-    sha256: String,
+    sha256: Option<String>,
 }
 
 fn extract(payload: &Payload, cli: &Cli) -> Result<()> {
@@ -114,6 +118,7 @@ fn extract(payload: &Payload, cli: &Cli) -> Result<()> {
         partitions: cli.partitions.clone(),
         source_dir: cli.source.clone(),
         overwrite: cli.force,
+        verify: !cli.no_verify,
         threads: cli.jobs,
         cancel: Some(cancel),
         ..ExtractOptions::default()
@@ -163,7 +168,7 @@ fn extract(payload: &Payload, cli: &Cli) -> Result<()> {
                 partition: &image.partition,
                 path: &image.path,
                 size: image.size,
-                sha256: hex(&image.sha256),
+                sha256: image.sha256.as_deref().map(hex),
             })
             .collect();
         let mut out = io::stdout().lock();
