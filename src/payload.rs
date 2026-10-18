@@ -18,10 +18,11 @@ use std::sync::Arc;
 use prost::Message;
 
 use crate::error::{Error, Result, ensure};
-use crate::input::{LocalFile, ReadAt};
+use crate::input::{self, LocalFile, ReadAt};
 use crate::metadata::{DeltaArchiveManifest, PartitionUpdate};
 
 const MAGIC: [u8; 4] = *b"CrAU";
+const ZIP_MAGIC: [u8; 4] = *b"PK\x03\x04";
 const HEADER_LEN: u64 = 24;
 const SUPPORTED_MAJOR_VERSION: u64 = 2;
 
@@ -32,12 +33,13 @@ pub struct Payload {
 }
 
 impl Payload {
-    /// Opens a `payload.bin`.
+    /// Opens a `payload.bin` or an OTA zip archive that contains one.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::from_reader(Arc::new(LocalFile::open(path.as_ref())?))
     }
 
-    /// Reads a payload from any random-access source.
+    /// Reads a payload from any random-access source holding either a raw
+    /// payload or an OTA zip archive.
     pub fn from_reader(reader: Arc<dyn ReadAt>) -> Result<Self> {
         let mut magic = [0u8; 4];
         ensure!(
@@ -45,14 +47,26 @@ impl Payload {
             Error::NotPayload("input is too small to be a payload".into())
         );
         reader.read_exact_at(&mut magic, 0).map_err(Error::Read)?;
-        ensure!(magic == MAGIC, Error::NotPayload("input is not a payload.bin".into()));
+        let payload = match magic {
+            MAGIC => reader,
+            ZIP_MAGIC => input::payload_in_zip(reader)?,
+            _ => {
+                return Err(Error::NotPayload(
+                    "input is neither a payload.bin nor an OTA zip archive".into(),
+                ));
+            }
+        };
+        Self::parse(payload)
+    }
 
+    fn parse(reader: Arc<dyn ReadAt>) -> Result<Self> {
         let mut header = [0u8; HEADER_LEN as usize];
         ensure!(
             reader.size() >= HEADER_LEN,
             Error::invalid("payload header is truncated")
         );
         reader.read_exact_at(&mut header, 0).map_err(Error::Read)?;
+        ensure!(header[..4] == MAGIC, Error::NotPayload("missing payload magic".into()));
         let version = u64::from_be_bytes(header[4..12].try_into().unwrap());
         ensure!(version == SUPPORTED_MAJOR_VERSION, Error::UnsupportedVersion(version));
         let manifest_size = u64::from_be_bytes(header[12..20].try_into().unwrap());
@@ -107,7 +121,7 @@ impl Payload {
         self.partitions().iter().any(crate::partition::reads_source)
     }
 
-    /// Size in bytes of the payload itself.
+    /// Size in bytes of the payload itself, excluding any surrounding archive.
     pub fn size(&self) -> u64 {
         self.reader.size()
     }

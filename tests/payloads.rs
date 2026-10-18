@@ -4,7 +4,8 @@
 //! images match the ones the payload was made from.
 
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -214,4 +215,24 @@ fn truncated_payload() {
 fn not_a_payload() {
     let error = Payload::open(data("delta/old/raw.img")).err().unwrap();
     assert!(matches!(error, Error::NotPayload(_)), "{error:?}");
+}
+
+/// Payloads inside OTA zip archives, stored as they are or compressed.
+#[test]
+fn zip_archives() {
+    for method in [zip::CompressionMethod::Stored, zip::CompressionMethod::Deflated] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ota.zip");
+        let mut zip = zip::ZipWriter::new(File::create(&path).unwrap());
+        let entry = zip::write::SimpleFileOptions::default().compression_method(method);
+        zip.start_file("META-INF/com/android/metadata", entry).unwrap();
+        io::Write::write_all(&mut zip, b"ota-type=AB\n").unwrap();
+        zip.start_file("payload.bin", entry).unwrap();
+        io::copy(&mut File::open(data("delta/payload.bin")).unwrap(), &mut zip).unwrap();
+        zip.finish().unwrap();
+
+        let payload = Payload::open(&path).unwrap();
+        let (options, _out) = options(Some("delta"));
+        assert_eq!(extract(&payload, &options).unwrap().len(), 1, "{method:?}");
+    }
 }

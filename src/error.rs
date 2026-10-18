@@ -30,6 +30,12 @@ pub enum Error {
     #[error("cannot decode the payload manifest")]
     Manifest(#[from] prost::DecodeError),
 
+    #[error("cannot read the zip archive")]
+    Zip(#[from] zip::result::ZipError),
+
+    #[error("cannot unpack payload.bin from the zip archive")]
+    Unpack(#[source] io::Error),
+
     #[error("cannot start worker threads")]
     Threads(#[source] rayon::ThreadPoolBuildError),
 
