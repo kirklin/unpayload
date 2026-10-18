@@ -1,0 +1,364 @@
+//! Extracting partition images from a payload.
+//!
+//! Every selected partition is validated before anything is written. The
+//! operations of all partitions then run in parallel: they write disjoint
+//! block ranges of their images, so their order does not matter. Images are
+//! written under a `.part` name and renamed once their SHA-256 matches the
+//! manifest.
+
+use std::fs::{self, OpenOptions};
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use rayon::prelude::*;
+use sha2::{Digest, Sha256};
+
+use crate::budget::Budget;
+use crate::error::{Error, Result, ensure};
+use crate::extent::{byte_ranges, ensure_disjoint, total_len};
+use crate::fsio::NamedFile;
+use crate::metadata::{InstallOperation, OperationType, PartitionInfo, PartitionUpdate};
+use crate::operation::{self, Target};
+use crate::partition::{self, operation_type};
+use crate::payload::Payload;
+
+#[derive(Clone, Debug)]
+pub struct ExtractOptions {
+    /// Directory the images are written to.
+    pub output_dir: PathBuf,
+    /// Partitions to extract; all of them when empty.
+    pub partitions: Vec<String>,
+    /// Replace images that already exist in `output_dir`.
+    pub overwrite: bool,
+    /// Worker threads; the number of CPUs when `None`.
+    pub threads: Option<NonZeroUsize>,
+    /// Memory that operations running at the same time may hold, in bytes.
+    pub memory_limit: u64,
+    /// Once set, extraction stops between operations with
+    /// [`Error::Cancelled`], removing the images it has not finished.
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl Default for ExtractOptions {
+    fn default() -> Self {
+        Self {
+            output_dir: PathBuf::from("."),
+            partitions: Vec::new(),
+            overwrite: false,
+            threads: None,
+            memory_limit: 4 << 30,
+            cancel: None,
+        }
+    }
+}
+
+/// Progress of an extraction.
+#[derive(Debug)]
+pub enum Event<'a> {
+    /// Extraction begins; `total` is the number of bytes that will be written.
+    Started { partitions: &'a [&'a str], total: u64 },
+    /// `bytes` more bytes of `partition` were written.
+    Progress { partition: &'a str, bytes: u64 },
+    /// An image was verified and moved into place.
+    Extracted(&'a Extracted),
+}
+
+#[derive(Clone, Debug)]
+pub struct Extracted {
+    pub partition: String,
+    pub path: PathBuf,
+    pub size: u64,
+    pub sha256: Vec<u8>,
+}
+
+impl Payload {
+    /// Writes the selected partition images into `options.output_dir`.
+    pub fn extract(&self, options: &ExtractOptions, events: &(dyn Fn(Event<'_>) + Sync)) -> Result<Vec<Extracted>> {
+        let updates = select(self, &options.partitions)?;
+        let jobs = updates
+            .into_iter()
+            .map(|update| Job::plan(self, update, options))
+            .collect::<Result<Vec<_>>>()?;
+        fs::create_dir_all(&options.output_dir).map_err(Error::file(&options.output_dir))?;
+
+        let names: Vec<&str> = jobs.iter().map(|job| job.name).collect();
+        let total = jobs.iter().map(|job| job.work).sum();
+        events(Event::Started {
+            partitions: &names,
+            total,
+        });
+
+        let threads = options
+            .threads
+            .or_else(|| std::thread::available_parallelism().ok())
+            .map_or(1, NonZeroUsize::get);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(Error::Threads)?;
+        let run = Run {
+            payload: self,
+            budget: Budget::new(options.memory_limit),
+            aborted: AtomicBool::new(false),
+            cancel: options.cancel.as_deref(),
+            failure: Mutex::new(None),
+            events,
+        };
+        let extracted = pool.install(|| {
+            jobs.par_iter()
+                .filter_map(|job| run.guard(job.name, || job.run(&run)))
+                .collect::<Vec<_>>()
+        });
+        match run.failure.into_inner().unwrap() {
+            Some(error) => Err(error),
+            None => Ok(extracted),
+        }
+    }
+}
+
+fn select<'p>(payload: &'p Payload, names: &[String]) -> Result<Vec<&'p PartitionUpdate>> {
+    if names.is_empty() {
+        return Ok(payload.partitions().iter().collect());
+    }
+    let mut selected: Vec<&PartitionUpdate> = Vec::new();
+    let mut unknown = Vec::new();
+    for name in names {
+        match payload.partition(name) {
+            Some(update) if !selected.iter().any(|u| u.partition_name == *name) => selected.push(update),
+            Some(_) => {}
+            None => unknown.push(name.clone()),
+        }
+    }
+    ensure!(unknown.is_empty(), Error::UnknownPartitions(unknown));
+    Ok(selected)
+}
+
+struct Run<'a> {
+    payload: &'a Payload,
+    budget: Budget,
+    aborted: AtomicBool,
+    cancel: Option<&'a AtomicBool>,
+    failure: Mutex<Option<Error>>,
+    events: &'a (dyn Fn(Event<'_>) + Sync),
+}
+
+impl Run<'_> {
+    fn check(&self) -> Result<()> {
+        ensure!(
+            !self.cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)),
+            Error::Cancelled
+        );
+        ensure!(!self.aborted.load(Ordering::Relaxed), Error::Stopped);
+        Ok(())
+    }
+
+    /// Runs `work`, recording the first real failure and stopping the rest.
+    fn guard<T>(&self, partition: &str, work: impl FnOnce() -> Result<T>) -> Option<T> {
+        match work() {
+            Ok(value) => Some(value),
+            Err(error) => {
+                self.aborted.store(true, Ordering::Relaxed);
+                if !matches!(error, Error::Stopped) {
+                    let error = match error {
+                        Error::Operation { .. } | Error::Partition { .. } | Error::Cancelled => error,
+                        error => Error::Partition {
+                            partition: partition.to_owned(),
+                            source: Box::new(error),
+                        },
+                    };
+                    self.failure.lock().unwrap().get_or_insert(error);
+                }
+                None
+            }
+        }
+    }
+
+    fn progress(&self, partition: &str, bytes: u64) {
+        (self.events)(Event::Progress { partition, bytes });
+    }
+}
+
+struct Job<'p> {
+    update: &'p PartitionUpdate,
+    name: &'p str,
+    size: u64,
+    block_size: u64,
+    kinds: Vec<OperationType>,
+    output: PathBuf,
+    partial: PathBuf,
+    work: u64,
+}
+
+impl<'p> Job<'p> {
+    /// Validates a partition update and works out what extracting it takes.
+    fn plan(payload: &Payload, update: &'p PartitionUpdate, options: &ExtractOptions) -> Result<Self> {
+        let name = update.partition_name.as_str();
+        let in_partition = |error: Error| Error::Partition {
+            partition: name.to_owned(),
+            source: Box::new(error),
+        };
+        ensure!(
+            !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != "..",
+            Error::invalid(format!("unusable partition name {name:?}"))
+        );
+        let block_size = u64::from(payload.block_size());
+        let size = partition::new_size(update)
+            .ok_or_else(|| in_partition(Error::invalid("the manifest gives no image size")))?;
+        let image_end = size.div_ceil(block_size) * block_size;
+        let data_size = payload.size() - payload.data_offset();
+
+        let mut kinds = Vec::with_capacity(update.operations.len());
+        let mut written = Vec::new();
+        for (index, op) in update.operations.iter().enumerate() {
+            let in_operation = |error: Error| Error::Operation {
+                partition: name.to_owned(),
+                index,
+                kind: operation_type(op).map_or("unknown", OperationType::name),
+                source: Box::new(error),
+            };
+            let kind = operation_type(op)
+                .ok_or_else(|| in_operation(Error::invalid(format!("unsupported operation type {}", op.r#type))))?;
+            let dst = byte_ranges(&op.dst_extents, block_size).map_err(in_operation)?;
+            ensure!(
+                dst.iter().all(|range| range.end <= image_end),
+                in_operation(Error::invalid("destination extents run past the end of the image"))
+            );
+            ensure!(
+                op.data_offset()
+                    .checked_add(op.data_length())
+                    .is_some_and(|end| end <= data_size),
+                in_operation(Error::invalid("operation data runs past the end of the payload"))
+            );
+            written.extend(dst);
+            kinds.push(kind);
+        }
+        ensure_disjoint(&mut written).map_err(in_partition)?;
+
+        let output = options.output_dir.join(format!("{name}.img"));
+        let partial = options.output_dir.join(format!("{name}.img.part"));
+        ensure!(options.overwrite || !output.exists(), Error::OutputExists(output));
+
+        Ok(Self {
+            update,
+            name,
+            size,
+            block_size,
+            kinds,
+            output,
+            partial,
+            work: total_len(&written),
+        })
+    }
+
+    fn run(&self, run: &Run) -> Result<Extracted> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.partial)
+            .map_err(Error::file(&self.partial))?;
+        let partial = RemoveOnDrop(Some(&self.partial));
+        file.set_len(self.size).map_err(Error::file(&self.partial))?;
+        let image = NamedFile {
+            file: &file,
+            path: &self.partial,
+        };
+
+        let target = Target {
+            image,
+            block_size: self.block_size,
+        };
+        self.update
+            .operations
+            .par_iter()
+            .enumerate()
+            .try_for_each(|(index, op)| self.run_operation(index, op, &target, run))?;
+
+        run.check()?;
+        file.set_len(self.size).map_err(Error::file(&self.partial))?;
+
+        let sha256 = digest(image, self.size)?;
+        if let Some(expected) = hash(self.update.new_partition_info.as_ref())
+            && sha256 != expected
+        {
+            return Err(Error::hash_mismatch(format!("{}.img", self.name), expected, &sha256));
+        }
+        drop(file);
+        fs::rename(&self.partial, &self.output).map_err(Error::file(&self.output))?;
+        partial.disarm();
+        let extracted = Extracted {
+            partition: self.name.to_owned(),
+            path: self.output.clone(),
+            size: self.size,
+            sha256,
+        };
+        (run.events)(Event::Extracted(&extracted));
+        Ok(extracted)
+    }
+
+    fn run_operation(&self, index: usize, op: &InstallOperation, target: &Target, run: &Run) -> Result<()> {
+        run.check()?;
+        let kind = self.kinds[index];
+        let mut data = vec![0u8; op.data_length() as usize];
+        if !data.is_empty() {
+            run.payload.read_data(op.data_offset(), &mut data)?;
+        }
+        let result = (|| {
+            if let Some(expected) = op.data_sha256_hash.as_deref().filter(|h| !h.is_empty()) {
+                let actual = Sha256::digest(&data);
+                ensure!(
+                    actual.as_slice() == expected,
+                    Error::hash_mismatch("operation data", expected, &actual)
+                );
+            }
+            let _permit = run.budget.acquire(operation::memory(op));
+            operation::execute(op, kind, &data, target)
+        })();
+        result.map_err(|error| Error::Operation {
+            partition: self.name.to_owned(),
+            index,
+            kind: kind.name(),
+            source: Box::new(error),
+        })?;
+        let written = op.dst_extents.iter().map(|e| e.num_blocks()).sum::<u64>() * self.block_size;
+        run.progress(self.name, written);
+        Ok(())
+    }
+}
+
+/// The hash a partition image should have, when the manifest gives one.
+fn hash(info: Option<&PartitionInfo>) -> Option<&[u8]> {
+    info?.hash.as_deref().filter(|hash| !hash.is_empty())
+}
+
+fn digest(image: NamedFile, len: u64) -> Result<Vec<u8>> {
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 4 << 20];
+    let mut offset = 0;
+    while offset < len {
+        let n = (len - offset).min(buf.len() as u64) as usize;
+        image.read_exact_at(&mut buf[..n], offset)?;
+        hasher.update(&buf[..n]);
+        offset += n as u64;
+    }
+    Ok(hasher.finalize().to_vec())
+}
+
+struct RemoveOnDrop<'a>(Option<&'a Path>);
+
+impl RemoveOnDrop<'_> {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for RemoveOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(path) = self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
