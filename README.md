@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.png">
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/kirklin/unpayload/raw/HEAD/assets/banner-dark.png">
     <img src="assets/banner-light.png" alt="unpayload: extract partition images from Android OTA packages">
   </picture>
 </p>
