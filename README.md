@@ -15,7 +15,7 @@
 ## Install
 
 ```sh
-cargo install --git https://github.com/kirklin/unpayload
+cargo install unpayload
 ```
 
 ## Usage
