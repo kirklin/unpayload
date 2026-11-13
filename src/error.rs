@@ -36,6 +36,9 @@ pub enum Error {
     #[error("cannot unpack payload.bin from the zip archive")]
     Unpack(#[source] io::Error),
 
+    #[error("cannot create a temporary file for the image")]
+    Temporary(#[source] io::Error),
+
     #[error("cannot start worker threads")]
     Threads(#[source] rayon::ThreadPoolBuildError),
 

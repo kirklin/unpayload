@@ -18,12 +18,12 @@ use sha2::{Digest, Sha256};
 
 use crate::budget::Budget;
 use crate::error::{Error, Result, ensure, hex};
-use crate::extent::{byte_range, byte_ranges, ensure_disjoint, gaps, total_len};
+use crate::extent::total_len;
 use crate::fsio::NamedFile;
 use crate::metadata::{OperationType, PartitionInfo, PartitionUpdate};
 use crate::operation::{self, Target};
-use crate::partition::{self, operation_type};
 use crate::payload::Payload;
+use crate::plan::Plan;
 use crate::source::SourceImage;
 use crate::verity;
 
@@ -214,104 +214,32 @@ struct Job<'p> {
 impl<'p> Job<'p> {
     /// Validates a partition update and works out what extracting it takes.
     fn plan(payload: &Payload, update: &'p PartitionUpdate, options: &ExtractOptions) -> Result<Self> {
-        let name = update.partition_name.as_str();
-        let in_partition = |error: Error| Error::Partition {
-            partition: name.to_owned(),
-            source: Box::new(error),
-        };
-        ensure!(
-            !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != "..",
-            Error::invalid(format!("unusable partition name {name:?}"))
-        );
-        let block_size = u64::from(payload.block_size());
-        let size = partition::new_size(update)
-            .ok_or_else(|| in_partition(Error::invalid("the manifest gives no image size")))?;
-        let image_end = size.div_ceil(block_size) * block_size;
-        let data_size = payload.size() - payload.data_offset();
-
-        let mut kinds = Vec::with_capacity(update.operations.len());
-        let mut written = Vec::new();
-        for (index, op) in update.operations.iter().enumerate() {
-            let in_operation = |error: Error| Error::Operation {
-                partition: name.to_owned(),
-                index,
-                kind: operation_type(op).map_or("unknown", OperationType::name),
-                source: Box::new(error),
-            };
-            let kind = operation_type(op)
-                .ok_or_else(|| in_operation(Error::invalid(format!("unsupported operation type {}", op.r#type))))?;
-            ensure!(
-                kind != OperationType::Move,
-                in_operation(Error::invalid(
-                    "MOVE operations update a partition in place and cannot be extracted"
-                ))
-            );
-            let dst = byte_ranges(&op.dst_extents, block_size).map_err(in_operation)?;
-            ensure!(
-                dst.iter().all(|range| range.end <= image_end),
-                in_operation(Error::invalid("destination extents run past the end of the image"))
-            );
-            ensure!(
-                op.data_offset()
-                    .checked_add(op.data_length())
-                    .is_some_and(|end| end <= data_size),
-                in_operation(Error::invalid("operation data runs past the end of the payload"))
-            );
-            written.extend(dst);
-            kinds.push(kind);
-        }
-        ensure_disjoint(&mut written).map_err(in_partition)?;
+        let plan = Plan::new(payload, update)?;
+        let name = plan.name;
 
         let output = options.output_dir.join(format!("{name}.img"));
         let partial = options.output_dir.join(format!("{name}.img.part"));
-        let source = if partition::reads_source(update) {
-            let dir = options
-                .source_dir
-                .as_ref()
-                .ok_or_else(|| Error::MissingSource(name.to_owned()))?;
-            let path = dir.join(format!("{name}.img"));
-            let image = SourceImage::open(&path)?;
-            if let Some(expected) = update.old_partition_info.as_ref().and_then(|info| info.size) {
-                ensure!(
-                    image.size() >= expected,
-                    Error::Source(format!(
-                        "{} is {} bytes, the payload updates an image of {expected} bytes",
-                        path.display(),
-                        image.size()
-                    ))
-                );
-            }
-            if same_file(&path, &output) {
-                return Err(Error::Source(format!(
-                    "{} is both the source image and the output, choose another output directory",
-                    path.display()
-                )));
-            }
-            Some(image)
-        } else {
-            None
-        };
+        let source = plan.source(options.source_dir.as_deref())?;
+        if let Some(image) = &source
+            && same_file(image.path(), &output)
+        {
+            return Err(Error::Source(format!(
+                "{} is both the source image and the output, choose another output directory",
+                image.path().display()
+            )));
+        }
         ensure!(options.overwrite || !output.exists(), Error::OutputExists(output));
 
-        let tree = byte_range(update.hash_tree_extent, block_size).map_err(in_partition)?;
-        let fec = byte_range(update.fec_extent, block_size).map_err(in_partition)?;
-        let fallthrough = match &source {
-            Some(image) => {
-                let mut covered = written.clone();
-                covered.extend([tree.clone(), fec.clone()]);
-                covered.sort_unstable_by_key(|range| range.start);
-                gaps(&covered, size.min(image.size()))
-            }
-            None => Vec::new(),
-        };
-        let work = total_len(&written) + total_len(&fallthrough) + (tree.end - tree.start) + (fec.end - fec.start);
+        let (tree, fec) = plan.verity()?;
+        let fallthrough = plan.fallthrough(source.as_ref(), &tree, &fec);
+        let work = total_len(&plan.written) + total_len(&fallthrough) + (tree.end - tree.start) + (fec.end - fec.start);
 
         Ok(Self {
             update,
             name,
-            size,
-            block_size,
-            kinds,
+            size: plan.size,
+            block_size: plan.block_size,
+            kinds: plan.kinds,
             chunks: chunks(update, payload.read_granularity()),
             source,
             fallthrough,

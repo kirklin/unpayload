@@ -26,9 +26,12 @@ const ZIP_MAGIC: [u8; 4] = *b"PK\x03\x04";
 const HEADER_LEN: u64 = 24;
 const SUPPORTED_MAJOR_VERSION: u64 = 2;
 
+/// An opened payload. Clones share the source it is read from and its
+/// manifest.
+#[derive(Clone)]
 pub struct Payload {
     reader: Arc<dyn ReadAt>,
-    manifest: DeltaArchiveManifest,
+    manifest: Arc<DeltaArchiveManifest>,
     data_offset: u64,
 }
 
@@ -97,7 +100,7 @@ impl Payload {
         );
         Ok(Self {
             reader,
-            manifest,
+            manifest: Arc::new(manifest),
             data_offset,
         })
     }
